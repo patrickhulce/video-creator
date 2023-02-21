@@ -1,7 +1,9 @@
+import {getPhotosAuthToken} from '../shared/google-oauth'
 import * as fs from 'fs'
 import * as path from 'path'
-
-export {}
+import fetch, {Response} from 'node-fetch'
+import {GoogleMediaItem} from '../shared/models'
+import pLimit from 'p-limit'
 
 enum OrganizationScheme {
   BY_YEAR = 'by_year',
@@ -20,7 +22,7 @@ interface SyncOptions {
   organizationScheme: OrganizationScheme
   destinationDirectory: string
 
-  googlePhotosApiKey: string
+  googlePhotosAuthToken: string
   googlePhotosFilters: SyncOptionsGooglePhotosFilters
 }
 
@@ -42,51 +44,53 @@ interface Manifest {
   files: FileOnDisk[]
 }
 
-async function main() {
-  // Gather all options necessary to build.
-  const syncOptions = buildSyncOptions()
+const concurrently = pLimit(10)
 
+export async function main() {
+  console.log('Gathering options...')
+  // Gather all options necessary to build.
+  const syncOptions = await buildSyncOptions()
+
+  console.log('Building file manifest...')
   // Build a manifest from directory (existing files)
   const manifest = await buildManifestFromDisk(syncOptions)
+  console.log(`Detected ${manifest.files.length} existing files.`)
 
+  console.log('Querying Google Photos API...')
   // Query Google Photos for matching items.
-  for await (const mediaItems of queryMediaItemsFromPhotos(syncOptions)) {
-    for (const mediaItem of mediaItems) {
-      // Compare matching items to manifest.
-      const matchingManifestItem = findMatchingManifestItem(manifest, mediaItem)
+  const promises = [Promise.resolve()]
+  for await (const mediaItem of queryMediaItemsFromPhotos(syncOptions)) {
+    const promise = concurrently(() => processMediaItem(syncOptions, manifest, mediaItem))
 
-      // Compute desired path to actual (missing or elsewhere).
-      const destinationPath = buildDestinationPath(syncOptions, mediaItem)
-
-      if (matchingManifestItem) {
-        // Check if already at destination, if not, move.
-      } else {
-        // Download to destination.
-      }
-    }
+    promises.push(
+      promise.catch(error => {
+        console.error(`Failed to process ${mediaItem.filename}: ${error.stack || error}`)
+      }),
+    )
   }
+
+  await Promise.all(promises)
+  console.log('Done!')
 }
 
-function buildSyncOptions(): SyncOptions {
+async function buildSyncOptions(): Promise<SyncOptions> {
   const destinationDirectory = process.env.GOOGLE_PHOTOS_DEST_DIR
   if (!destinationDirectory) throw new Error(`GOOGLE_PHOTOS_DEST_DIR not set`)
-  const googlePhotosApiKey = process.env.GOOGLE_PHOTOS_API_KEY
-  if (!googlePhotosApiKey) throw new Error(`GOOGLE_PHOTOS_API_KEY not set`)
 
   return {
     destinationDirectory,
     organizationScheme: OrganizationScheme.BY_YEAR,
 
-    googlePhotosApiKey,
+    googlePhotosAuthToken: await getPhotosAuthToken(),
     googlePhotosFilters: {
       mediaType: 'VIDEO',
-      startDate: '2021-02-14',
+      startDate: '2023-01-14',
       endDate: '2023-03-01',
     },
   }
 }
 
-async function buildManifestFromDisk(options: SyncOptions): Promise<Array<FileOnDisk>> {
+async function buildManifestFromDisk(options: SyncOptions): Promise<Manifest> {
   const {destinationDirectory} = options
 
   const files: Array<FileOnDisk> = []
@@ -114,14 +118,16 @@ async function buildManifestFromDisk(options: SyncOptions): Promise<Array<FileOn
 
   await traverseDirectory(destinationDirectory, destinationDirectory)
 
-  return files
+  return {destinationPath: path.join(destinationDirectory, 'manifest.json'), files}
 }
 
-async function* queryMediaItemsFromPhotos(syncOptions: SyncOptions) {
-  const {googlePhotosApiKey, googlePhotosFilters} = syncOptions
+async function* queryMediaItemsFromPhotos(
+  syncOptions: SyncOptions,
+): AsyncGenerator<GoogleMediaItem> {
+  const {googlePhotosAuthToken, googlePhotosFilters} = syncOptions
 
-  const startParts = googlePhotosFilters.startDate.split('-')
-  const endParts = googlePhotosFilters.endDate.split('-')
+  const startParts = googlePhotosFilters.startDate.split('-').map(x => Number(x))
+  const endParts = googlePhotosFilters.endDate.split('-').map(x => Number(x))
   const startDate = {year: startParts[0], month: startParts[1], day: startParts[2]}
   const endDate = {year: endParts[0], month: endParts[1], day: endParts[2]}
 
@@ -135,11 +141,18 @@ async function* queryMediaItemsFromPhotos(syncOptions: SyncOptions) {
   const payload = {pageSize: 100, pageToken, filters}
 
   do {
-    const response = await fetch(`https://photoslibrary.googleapis.com/v1/mediaItems:search`, {
-      method: 'POST',
-      headers: {'content-type': 'application/json'},
-      body: JSON.stringify({...payload, pageToken}),
-    })
+    let response: Response = await fetch(
+      `https://photoslibrary.googleapis.com/v1/mediaItems:search`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          Authorization: `Bearer ${googlePhotosAuthToken}`,
+        },
+        redirect: 'follow',
+        body: JSON.stringify({...payload, pageToken}),
+      },
+    )
     if (!response.ok) throw new Error(`Failed request: ${await response.text()}`)
     const body = await response.json()
 
@@ -151,6 +164,73 @@ async function* queryMediaItemsFromPhotos(syncOptions: SyncOptions) {
 
     pageToken = body.nextPageToken
   } while (pageToken)
+}
+
+async function processMediaItem(
+  syncOptions: SyncOptions,
+  manifest: Manifest,
+  mediaItem: GoogleMediaItem,
+) {
+  // Compare matching items to manifest.
+  const matchingManifestItem = findMatchingManifestItem(manifest, mediaItem)
+
+  // // Compute desired path to actual (missing or elsewhere).
+  const destinationPath = buildDestinationPath(syncOptions, mediaItem)
+  const folderPath = path.dirname(destinationPath)
+  if (!fs.existsSync(folderPath)) await fs.promises.mkdir(folderPath, {recursive: true})
+
+  if (matchingManifestItem) {
+    // Check if already at destination, if not, move.
+    if (matchingManifestItem.fullPath === destinationPath) {
+      console.log(`${matchingManifestItem.basename} already up-to-date.`)
+    } else {
+      await fs.promises.rename(matchingManifestItem.fullPath, destinationPath)
+      console.log('Moved file to', destinationPath)
+    }
+  } else {
+    // Download to destination.
+    console.log(`Downloading ${mediaItem.filename}...`)
+    await downloadFile(mediaItem, destinationPath)
+    console.log(`File downloaded to ${destinationPath}`)
+  }
+}
+
+function findMatchingManifestItem(
+  manifest: Manifest,
+  mediaItem: GoogleMediaItem,
+): FileOnDisk | undefined {
+  return manifest.files.find(
+    item => item.basename.toLowerCase() === mediaItem.filename.toLowerCase(),
+  )
+}
+
+function buildDestinationPath(syncOptions: SyncOptions, mediaItem: GoogleMediaItem): string {
+  const [year] = (mediaItem.mediaMetadata.creationTime || 'UNKNOWN').split('-', 2)
+  return path.join(syncOptions.destinationDirectory, year, mediaItem.filename)
+}
+
+async function downloadFile(mediaItem: GoogleMediaItem, destinationPath: string): Promise<void> {
+  const downloadUrl = mediaItem.mediaMetadata.video
+    ? `${mediaItem.baseUrl}=dv`
+    : `${mediaItem.baseUrl}=d`
+
+  const response = await fetch(downloadUrl, {redirect: 'follow'})
+  if (!response.ok) throw new Error(`Failed to fetch ${downloadUrl}: ${response.text()}`)
+
+  const file = fs.createWriteStream(destinationPath)
+  return new Promise((resolve, reject) => {
+    response.body
+      .pipe(file)
+      .on('finish', () => {
+        file.close(() => {
+          resolve()
+        })
+      })
+      .on('error', error => {
+        fs.unlink(destinationPath, () => reject(error))
+        reject(error)
+      })
+  })
 }
 
 main().catch(err => {
