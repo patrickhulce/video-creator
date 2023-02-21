@@ -35,6 +35,8 @@ interface FileOnDisk {
   basename: string
   /** The size of the file on disk in bytes. */
   size: number
+  /** The date at which the file was last modified. */
+  modifiedAt: Date
 }
 
 interface Manifest {
@@ -84,7 +86,7 @@ async function buildSyncOptions(): Promise<SyncOptions> {
     googlePhotosAuthToken: await getPhotosAuthToken(),
     googlePhotosFilters: {
       mediaType: 'VIDEO',
-      startDate: '2023-01-14',
+      startDate: '2021-02-14',
       endDate: '2023-03-01',
     },
   }
@@ -111,6 +113,7 @@ async function buildManifestFromDisk(options: SyncOptions): Promise<Manifest> {
           fullPath,
           size: stats.size,
           basename: path.basename(relativePath),
+          modifiedAt: stats.mtime,
         })
       }
     }
@@ -174,23 +177,33 @@ async function processMediaItem(
   // Compare matching items to manifest.
   const matchingManifestItem = findMatchingManifestItem(manifest, mediaItem)
 
-  // // Compute desired path to actual (missing or elsewhere).
+  // Compute desired path to actual (missing or elsewhere).
   const destinationPath = buildDestinationPath(syncOptions, mediaItem)
   const folderPath = path.dirname(destinationPath)
   if (!fs.existsSync(folderPath)) await fs.promises.mkdir(folderPath, {recursive: true})
 
   if (matchingManifestItem) {
-    // Check if already at destination, if not, move.
     if (matchingManifestItem.fullPath === destinationPath) {
+      // Check if already at destination, if not, move.
       console.log(`${matchingManifestItem.basename} already up-to-date.`)
     } else {
       await fs.promises.rename(matchingManifestItem.fullPath, destinationPath)
       console.log('Moved file to', destinationPath)
     }
+
+    const modifiedDifferenceInSeconds =
+      Math.abs(
+        new Date(mediaItem.mediaMetadata.creationTime || 0).getTime() -
+          matchingManifestItem.modifiedAt.getTime(),
+      ) / 1000
+    const SECONDS_IN_A_DAY = 60 * 60 * 24
+    if (modifiedDifferenceInSeconds > SECONDS_IN_A_DAY)
+      await setModifiedTime(mediaItem, destinationPath)
   } else {
     // Download to destination.
     console.log(`Downloading ${mediaItem.filename}...`)
     await downloadFile(mediaItem, destinationPath)
+    await setModifiedTime(mediaItem, destinationPath)
     console.log(`File downloaded to ${destinationPath}`)
   }
 }
@@ -205,8 +218,17 @@ function findMatchingManifestItem(
 }
 
 function buildDestinationPath(syncOptions: SyncOptions, mediaItem: GoogleMediaItem): string {
-  const [year] = (mediaItem.mediaMetadata.creationTime || 'UNKNOWN').split('-', 2)
-  return path.join(syncOptions.destinationDirectory, year, mediaItem.filename)
+  const creationTime = new Date(mediaItem.mediaMetadata.creationTime || 'UNKNOWN')
+  const year = String(creationTime.getFullYear())
+  let filename = mediaItem.filename
+  const numberOfDigitsInName = filename.replace(/[^0-9]+/g, '').length
+  // Fix for iPhone photos which have stupidly non-unique filenames.
+  if (filename.startsWith('IMG_') || numberOfDigitsInName <= 8) {
+    const [datePart, timePart] = creationTime.toISOString().replace(/\..*$/, '').split('T')
+    filename = `DISAMBIG_${datePart.replace(/-/g, '')}_${timePart.replace(/:/g, '')}_${filename}`
+  }
+
+  return path.join(syncOptions.destinationDirectory, year, filename)
 }
 
 async function downloadFile(mediaItem: GoogleMediaItem, destinationPath: string): Promise<void> {
@@ -231,6 +253,16 @@ async function downloadFile(mediaItem: GoogleMediaItem, destinationPath: string)
         reject(error)
       })
   })
+}
+
+async function setModifiedTime(mediaItem: GoogleMediaItem, destinationPath: string): Promise<void> {
+  if (!mediaItem.mediaMetadata.creationTime) return
+
+  await fs.promises.utimes(
+    destinationPath,
+    Date.now(),
+    new Date(mediaItem.mediaMetadata.creationTime),
+  )
 }
 
 main().catch(err => {
